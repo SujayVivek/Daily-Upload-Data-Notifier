@@ -1,0 +1,20 @@
+{
+  "name": "neurasixai-data-ingestion-summary",
+  "version": "1.0.0",
+  "description": "Daily S3 ingestion summary emailer (12PM IST window)",
+  "main": "s3_daily_summary.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node s3_daily_summary.js",
+    "dry": "node s3_daily_summary.js --dry"
+  },
+  "author": "NeurasixAI",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.637.0",
+    "dotenv": "^16.4.5",
+    "luxon": "^3.4.4",
+    "nodemailer": "^6.9.15",
+    "xlsx": "^0.18.5"
+  }
+}
