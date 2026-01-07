@@ -132,30 +132,26 @@ function buildWorkbook(allUploads, perBucketFolderCounts, windowIST, saveDir) {
    EMAIL SAFE HTML
    =========================== */
 function buildHtmlSummary(perBucketFolderCounts, windowIST, totalUploads) {
+  const escapeHtml = (s) => String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
   const windowText = `${windowIST.startIST.toFormat('dd LLL yyyy, hh:mm a')} → ${windowIST.endIST.toFormat('dd LLL yyyy, hh:mm a')} IST`;
   const generatedAt = DateTime.now().setZone('Asia/Kolkata').toFormat('dd LLL yyyy, hh:mm a');
-
-  let topRows = '';
-  for (const [bucket, folderMap] of perBucketFolderCounts.entries()) {
-    for (const [folder, count] of folderMap.entries()) {
-      topRows += `
-        <tr>
-          <td style="padding:8px;border:1px solid #e5e7eb;">${bucket}</td>
-          <td style="padding:8px;border:1px solid #e5e7eb;">${folder}</td>
-          <td style="padding:8px;border:1px solid #e5e7eb;">${count}</td>
-        </tr>`;
-    }
-  }
 
   let bucketSections = '';
   for (const [bucket, folderMap] of perBucketFolderCounts.entries()) {
     let rows = '';
     let total = 0;
-    for (const [folder, count] of folderMap.entries()) {
+    const sorted = [...folderMap.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    for (const [folder, count] of sorted) {
       total += count;
       rows += `
         <tr>
-          <td style="padding:8px;border:1px solid #e5e7eb;">${folder}</td>
+          <td style="padding:8px;border:1px solid #e5e7eb;">${escapeHtml(folder === '/' ? '/' : folder + '/')}</td>
           <td style="padding:8px;border:1px solid #e5e7eb;">${count}</td>
         </tr>`;
     }
@@ -189,15 +185,7 @@ function buildHtmlSummary(perBucketFolderCounts, windowIST, totalUploads) {
 <p><b>Buckets Scanned:</b> ${perBucketFolderCounts.size}</p>
 <p><b>Generated (IST):</b> ${generatedAt}</p>
 
-<h3>🏆 Top Folders</h3>
-<table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
-<tr>
-<th style="padding:8px;border:1px solid #e5e7eb;background:#f1f5f9;">Bucket</th>
-<th style="padding:8px;border:1px solid #e5e7eb;background:#f1f5f9;">Folder</th>
-<th style="padding:8px;border:1px solid #e5e7eb;background:#f1f5f9;">Uploads</th>
-</tr>
-${topRows || `<tr><td colspan="3" style="padding:8px;">No uploads</td></tr>`}
-</table>
+<!-- Per-bucket summaries below; Top Folders section removed by request. -->
 
 ${bucketSections}
 
@@ -240,19 +228,47 @@ async function main() {
   const perBucketFolderCounts = new Map();
   const allUploads = [];
 
+  log('info', `Window (IST): ${windowIST.startIST.toFormat('dd LLL yyyy, hh:mm a')} → ${windowIST.endIST.toFormat('dd LLL yyyy, hh:mm a')}`);
+  log('info', `Buckets to scan: ${buckets.length} (${buckets.join(', ')})`);
+
   for (const bucket of buckets) {
+    log('info', `Scanning bucket: ${bucket} ...`);
     const { uploads, folderCounts } =
       await listBucketUploadsInWindow(bucket, windowIST.startUTC, windowIST.endUTC);
     perBucketFolderCounts.set(bucket, folderCounts);
     allUploads.push(...uploads.map(u => ({ ...u, Bucket: bucket })));
+
+    const folderCount = folderCounts.size;
+    const uploadCount = uploads.length;
+    log('info', `Found ${uploadCount} uploads across ${folderCount} folder(s) in ${bucket}`);
+
+    if (folderCount > 0) {
+      const top5 = [...folderCounts.entries()]
+        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+        .slice(0, 5)
+        .map(([f, c]) => `${f === '/' ? '/' : f + '/'}: ${c}`)
+        .join(' | ');
+      log('info', `Top folders (${bucket}): ${top5}`);
+    }
   }
 
   const reportsDir = path.join(__dirname, 'reports');
   const attachmentPath = buildWorkbook(allUploads, perBucketFolderCounts, windowIST, reportsDir);
+  log('info', `Workbook saved: ${attachmentPath}`);
+
   const html = buildHtmlSummary(perBucketFolderCounts, windowIST, allUploads.length);
 
+  const subject = `Daily S3 Ingestion Summary — ${windowIST.endIST.toFormat('dd LLL yyyy')}`;
+
+  if (DRY_RUN) {
+    log('info', `DRY RUN enabled — skipping email send.`);
+    log('info', `Would email to: ${TO_EMAIL.join(', ')}`);
+    log('info', `Subject: ${subject}`);
+    return;
+  }
+
   await sendEmail({
-    subject: `Daily S3 Ingestion Summary — ${windowIST.endIST.toFormat('dd LLL yyyy')}`,
+    subject,
     html,
     attachments: [{ filename: path.basename(attachmentPath), path: attachmentPath }],
   });
