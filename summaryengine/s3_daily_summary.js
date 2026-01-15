@@ -12,10 +12,42 @@ const AWS_ACCESS_KEY_ID = process.env.AWS_ACCESS_KEY_ID;
 const AWS_SECRET_ACCESS_KEY = process.env.AWS_SECRET_ACCESS_KEY;
 const S3_BUCKETS_RAW = process.env.S3_BUCKETS;
 
-const TO_EMAIL = (process.env.TO_EMAIL || '')
-  .split(',')
-  .map(e => e.replace(/^["']|["']$/g, '').trim())
-  .filter(Boolean);
+function parseEnvEmails(raw) {
+  if (!raw) return [];
+  const cleaned = String(raw).trim();
+  // Prefer JSON array if provided, e.g. ["a@x.com","b@y.com"]
+  if (cleaned.startsWith('[')) {
+    try {
+      const arr = JSON.parse(cleaned);
+      const items = Array.isArray(arr) ? arr : [];
+      const out = [];
+      for (const item of items) {
+        if (item == null) continue;
+        String(item)
+          .split(',')
+          .forEach(p => {
+            const email = p.replace(/^['"]|['"]$/g, '').trim();
+            if (email) out.push(email);
+          });
+      }
+      return out;
+    } catch {
+      // Fallback: strip brackets and treat as CSV
+      const withoutBrackets = cleaned.replace(/^\[/, '').replace(/\]$/, '');
+      return withoutBrackets
+        .split(',')
+        .map(e => e.replace(/^['"]|['"]$/g, '').trim())
+        .filter(Boolean);
+    }
+  }
+  // Default: CSV string
+  return cleaned
+    .split(',')
+    .map(e => e.replace(/^['"]|['"]$/g, '').trim())
+    .filter(Boolean);
+}
+
+const TO_EMAIL = parseEnvEmails(process.env.TO_EMAIL || '');
 
 const FROM_EMAIL = process.env.FROM_EMAIL || process.env.SMTP_USERNAME;
 const SMTP_SERVER = process.env.SMTP_SERVER || 'smtp.gmail.com';

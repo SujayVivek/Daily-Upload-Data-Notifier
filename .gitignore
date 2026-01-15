@@ -1,3 +1,7 @@
-reports
+summaryengine/reports
 node_modules
-.env
+summaryengine/.env
+awscodes.txt
+data-upload-key.pem
+summaryengine/s3_daily_summary.zip
+
