@@ -228,11 +228,22 @@ function parseCaseType(folderPath) {
   return firstFolder || 'Other Cases';
 }
 
+function extractCountry(folderPath) {
+  const parts = folderPath.split('/').filter(Boolean);
+  
+  // Country is the second folder (index 1)
+  if (parts.length > 1) {
+    return parts[1];
+  }
+  
+  return 'Unknown';
+}
+
 function extractCourtAuthority(folderPath) {
   const parts = folderPath.split('/').filter(Boolean);
   
-  // Skip first folder (case type) and 'India' if present
-  const relevantParts = parts.slice(1).filter(p => p !== 'India');
+  // Skip first folder (case type) and second folder (country)
+  const relevantParts = parts.slice(2);
   
   if (relevantParts.length === 0) {
     return 'General';
@@ -251,20 +262,25 @@ function buildDetailedSummaryTable(perBucketFolderCounts) {
       if (folder === '/') continue; // Skip root folder
       
       const caseType = parseCaseType(folder);
+      const country = extractCountry(folder);
       const courtAuthority = extractCourtAuthority(folder);
       
       data.push({
         caseType,
+        country,
         courtAuthority,
         count
       });
     }
   }
   
-  // Sort by case type, then court authority
+  // Sort by case type, then country, then court authority
   data.sort((a, b) => {
     if (a.caseType !== b.caseType) {
       return a.caseType.localeCompare(b.caseType);
+    }
+    if (a.country !== b.country) {
+      return a.country.localeCompare(b.country);
     }
     return a.courtAuthority.localeCompare(b.courtAuthority);
   });
@@ -324,12 +340,13 @@ function buildHtmlSummary(perBucketFolderCounts, windowIST, totalUploads) {
       ${highLevelRows || `<tr><td colspan="2" style="padding:8px;">No data</td></tr>`}
     </table>`;
 
-  // Build Detailed Summary Table (Case Type → Court/Authority → Files)
+  // Build Detailed Summary Table (Case Type → Country → Court/Authority → Files)
   let detailedRows = '';
   for (const item of detailedData) {
     detailedRows += `
       <tr>
         <td style="padding:8px;border:1px solid #e5e7eb;">${escapeHtml(item.caseType)}</td>
+        <td style="padding:8px;border:1px solid #e5e7eb;">${escapeHtml(item.country)}</td>
         <td style="padding:8px;border:1px solid #e5e7eb;">${escapeHtml(item.courtAuthority)}</td>
         <td style="padding:8px;border:1px solid #e5e7eb;text-align:right;">${item.count}</td>
       </tr>`;
@@ -340,10 +357,11 @@ function buildHtmlSummary(perBucketFolderCounts, windowIST, totalUploads) {
     <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
       <tr>
         <th style="padding:10px;border:1px solid #e5e7eb;background:#1e40af;color:#ffffff;text-align:left;">Case Type</th>
-        <th style="padding:10px;border:1px solid #e5e7eb;background:#1e40af;color:#ffffff;text-align:left;">Country / Court</th>
-        <th style="padding:10px;border:1px solid #e5e7eb;background:#1e40af;color:#ffffff;text-align:right;">Number of Files</th>
+        <th style="padding:10px;border:1px solid #e5e7eb;background:#1e40af;color:#ffffff;text-align:left;">Country</th>
+        <th style="padding:10px;border:1px solid #e5e7eb;background:#1e40af;color:#ffffff;text-align:left;">Court / Authority</th>
+        <th style="padding:10px;border:1px solid #e5e7eb;background:#1e40af;color:#ffffff;text-align:right;">No. of Files</th>
       </tr>
-      ${detailedRows || `<tr><td colspan="3" style="padding:8px;">No data</td></tr>`}
+      ${detailedRows || `<tr><td colspan="4" style="padding:8px;">No data</td></tr>`}
     </table>`;
 
   let bucketSections = '';
