@@ -108,56 +108,182 @@ function parseEnvBuckets() {
 }
 
 async function listAllBuckets() {
-  const resp = await s3.send(new ListBucketsCommand({}));
-  return (resp.Buckets || []).map(b => b.Name);
+  try {
+    log('info', 'Fetching list of all buckets...');
+    const resp = await s3.send(new ListBucketsCommand({}));
+    const buckets = (resp.Buckets || []).map(b => b.Name);
+    log('info', `Found ${buckets.length} bucket(s): ${buckets.join(', ')}`);
+    return buckets;
+  } catch (error) {
+    log('error', `Failed to list buckets: ${error.message}`);
+    throw error;
+  }
 }
 
 async function listBucketUploadsInWindow(bucket, startUTC, endUTC) {
   const uploads = [];
   const folderCounts = new Map();
   let token;
+  let totalScanned = 0;
+  let batchCount = 0;
+  const startTime = Date.now();
 
-  do {
-    const resp = await s3.send(new ListObjectsV2Command({
-      Bucket: bucket,
-      ContinuationToken: token,
-      MaxKeys: 1000,
-    }));
+  try {
+    do {
+      batchCount++;
+      log('debug', `[${bucket}] Fetching batch ${batchCount} (continuation: ${token ? 'yes' : 'no'})...`);
+      
+      const resp = await s3.send(new ListObjectsV2Command({
+        Bucket: bucket,
+        ContinuationToken: token,
+        MaxKeys: 1000,
+      }));
 
-    for (const obj of resp.Contents || []) {
-      if (!obj.LastModified) continue;
-      if (obj.LastModified >= startUTC.toJSDate() && obj.LastModified < endUTC.toJSDate()) {
-        if (!obj.Key || obj.Key.endsWith('/')) continue;
-        const idx = obj.Key.lastIndexOf('/');
-        const folder = idx === -1 ? '/' : obj.Key.slice(0, idx);
-        folderCounts.set(folder, (folderCounts.get(folder) || 0) + 1);
-        uploads.push(obj);
+      const batchSize = (resp.Contents || []).length;
+      totalScanned += batchSize;
+      
+      log('info', `[${bucket}] Batch ${batchCount}: Scanned ${batchSize} objects | Total scanned: ${totalScanned}`);
+
+      for (const obj of resp.Contents || []) {
+        if (!obj.LastModified) continue;
+        if (obj.LastModified >= startUTC.toJSDate() && obj.LastModified < endUTC.toJSDate()) {
+          if (!obj.Key || obj.Key.endsWith('/')) continue;
+          const idx = obj.Key.lastIndexOf('/');
+          const folder = idx === -1 ? '/' : obj.Key.slice(0, idx);
+          folderCounts.set(folder, (folderCounts.get(folder) || 0) + 1);
+          uploads.push(obj);
+        }
       }
+
+      token = resp.NextContinuationToken;
+      
+      if (token) {
+        log('debug', `[${bucket}] More data available, continuing...`);
+      } else {
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+        log('info', `[${bucket}] Scan complete! Total objects scanned: ${totalScanned} in ${elapsed}s`);
+      }
+    } while (token);
+
+    return { uploads, folderCounts };
+  } catch (error) {
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+    log('error', `[${bucket}] Error after scanning ${totalScanned} objects in ${elapsed}s`);
+    log('error', `[${bucket}] Error details: ${error.message}`);
+    if (error.Code) log('error', `[${bucket}] AWS Error Code: ${error.Code}`);
+    if (error.$metadata) {
+      log('error', `[${bucket}] HTTP Status: ${error.$metadata.httpStatusCode}`);
+      log('error', `[${bucket}] Request ID: ${error.$metadata.requestId}`);
     }
-
-    token = resp.NextContinuationToken;
-  } while (token);
-
-  return { uploads, folderCounts };
+    throw error;
+  }
 }
 
 function buildWorkbook(allUploads, perBucketFolderCounts, windowIST, saveDir) {
-  const wb = XLSX.utils.book_new();
+  try {
+    log('info', `Building Excel workbook with ${allUploads.length} upload records...`);
+    const wb = XLSX.utils.book_new();
 
-  const uploadRows = allUploads.map(u => ({
-    Bucket: u.Bucket,
-    Key: u.Key,
-    Size: u.Size,
-  }));
+    const uploadRows = allUploads.map(u => ({
+      Bucket: u.Bucket,
+      Key: u.Key,
+      Size: u.Size,
+    }));
 
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(uploadRows), 'Uploads');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(uploadRows), 'Uploads');
 
-  if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
+    if (!fs.existsSync(saveDir)) {
+      log('debug', `Creating reports directory: ${saveDir}`);
+      fs.mkdirSync(saveDir, { recursive: true });
+    }
 
-  const filename = `s3_daily_uploads_${windowIST.endIST.toFormat('yyyyLLdd')}.xlsx`;
-  const out = path.join(saveDir, filename);
-  XLSX.writeFile(wb, out);
-  return out;
+    const filename = `s3_daily_uploads_${windowIST.endIST.toFormat('yyyyLLdd')}.xlsx`;
+    const out = path.join(saveDir, filename);
+    
+    log('debug', `Writing workbook to: ${out}`);
+    XLSX.writeFile(wb, out);
+    log('info', `Excel workbook created successfully: ${filename}`);
+    return out;
+  } catch (error) {
+    log('error', `Failed to build workbook: ${error.message}`);
+    throw error;
+  }
+}
+
+/* ===========================
+   FOLDER PATH PARSING
+   =========================== */
+function parseCaseType(folderPath) {
+  const firstFolder = folderPath.split('/')[0];
+  
+  if (firstFolder.includes('Direct-Taxes') || firstFolder.includes('Direct-Tax')) {
+    return 'Direct Tax Cases';
+  } else if (firstFolder.includes('Indirect-Taxes') || firstFolder.includes('Indirect-Tax')) {
+    return 'Indirect Tax Cases';
+  } else if (firstFolder.includes('commercial')) {
+    return 'Commercial Cases';
+  }
+  
+  // Default fallback
+  return firstFolder || 'Other Cases';
+}
+
+function extractCourtAuthority(folderPath) {
+  const parts = folderPath.split('/').filter(Boolean);
+  
+  // Skip first folder (case type) and 'India' if present
+  const relevantParts = parts.slice(1).filter(p => p !== 'India');
+  
+  if (relevantParts.length === 0) {
+    return 'General';
+  }
+  
+  // Join remaining parts with ' – ' (en dash)
+  return relevantParts.join(' – ');
+}
+
+function buildDetailedSummaryTable(perBucketFolderCounts) {
+  const data = [];
+  
+  // Collect all folder data from all buckets
+  for (const [bucket, folderMap] of perBucketFolderCounts.entries()) {
+    for (const [folder, count] of folderMap.entries()) {
+      if (folder === '/') continue; // Skip root folder
+      
+      const caseType = parseCaseType(folder);
+      const courtAuthority = extractCourtAuthority(folder);
+      
+      data.push({
+        caseType,
+        courtAuthority,
+        count
+      });
+    }
+  }
+  
+  // Sort by case type, then court authority
+  data.sort((a, b) => {
+    if (a.caseType !== b.caseType) {
+      return a.caseType.localeCompare(b.caseType);
+    }
+    return a.courtAuthority.localeCompare(b.courtAuthority);
+  });
+  
+  return data;
+}
+
+function buildHighLevelSummary(detailedData) {
+  const summary = new Map();
+  
+  for (const item of detailedData) {
+    const current = summary.get(item.caseType) || 0;
+    summary.set(item.caseType, current + item.count);
+  }
+  
+  // Convert to array and sort by case type
+  return [...summary.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([caseType, total]) => ({ caseType, total }));
 }
 
 /* ===========================
@@ -173,6 +299,52 @@ function buildHtmlSummary(perBucketFolderCounts, windowIST, totalUploads) {
 
   const windowText = `${windowIST.startIST.toFormat('dd LLL yyyy, hh:mm a')} → ${windowIST.endIST.toFormat('dd LLL yyyy, hh:mm a')} IST`;
   const generatedAt = DateTime.now().setZone('Asia/Kolkata').toFormat('dd LLL yyyy, hh:mm a');
+
+  // Generate business-friendly summaries
+  const detailedData = buildDetailedSummaryTable(perBucketFolderCounts);
+  const highLevelData = buildHighLevelSummary(detailedData);
+
+  // Build High-Level Summary Table (Case Type → Total Files)
+  let highLevelRows = '';
+  for (const item of highLevelData) {
+    highLevelRows += `
+      <tr>
+        <td style="padding:8px;border:1px solid #e5e7eb;">${escapeHtml(item.caseType)}</td>
+        <td style="padding:8px;border:1px solid #e5e7eb;text-align:right;">${item.total}</td>
+      </tr>`;
+  }
+
+  const highLevelTable = `
+    <h2 style="margin-top:24px;color:#1e40af;">📈 High-Level Summary</h2>
+    <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+      <tr>
+        <th style="padding:10px;border:1px solid #e5e7eb;background:#1e40af;color:#ffffff;text-align:left;">Case Type</th>
+        <th style="padding:10px;border:1px solid #e5e7eb;background:#1e40af;color:#ffffff;text-align:right;">Total Files</th>
+      </tr>
+      ${highLevelRows || `<tr><td colspan="2" style="padding:8px;">No data</td></tr>`}
+    </table>`;
+
+  // Build Detailed Summary Table (Case Type → Court/Authority → Files)
+  let detailedRows = '';
+  for (const item of detailedData) {
+    detailedRows += `
+      <tr>
+        <td style="padding:8px;border:1px solid #e5e7eb;">${escapeHtml(item.caseType)}</td>
+        <td style="padding:8px;border:1px solid #e5e7eb;">${escapeHtml(item.courtAuthority)}</td>
+        <td style="padding:8px;border:1px solid #e5e7eb;text-align:right;">${item.count}</td>
+      </tr>`;
+  }
+
+  const detailedTable = `
+    <h2 style="margin-top:32px;color:#1e40af;">📋 Detailed Summary</h2>
+    <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+      <tr>
+        <th style="padding:10px;border:1px solid #e5e7eb;background:#1e40af;color:#ffffff;text-align:left;">Case Type</th>
+        <th style="padding:10px;border:1px solid #e5e7eb;background:#1e40af;color:#ffffff;text-align:left;">Country / Court</th>
+        <th style="padding:10px;border:1px solid #e5e7eb;background:#1e40af;color:#ffffff;text-align:right;">Number of Files</th>
+      </tr>
+      ${detailedRows || `<tr><td colspan="3" style="padding:8px;">No data</td></tr>`}
+    </table>`;
 
   let bucketSections = '';
   for (const [bucket, folderMap] of perBucketFolderCounts.entries()) {
@@ -217,8 +389,12 @@ function buildHtmlSummary(perBucketFolderCounts, windowIST, totalUploads) {
 <p><b>Buckets Scanned:</b> ${perBucketFolderCounts.size}</p>
 <p><b>Generated (IST):</b> ${generatedAt}</p>
 
-<!-- Per-bucket summaries below; Top Folders section removed by request. -->
+<!-- Business-Friendly Summary Tables -->
+${highLevelTable}
+${detailedTable}
 
+<!-- Original Per-bucket summaries below -->
+<h2 style="margin-top:32px;color:#1e40af;">🪣 Bucket-wise Raw Folder Counts</h2>
 ${bucketSections}
 
 </td>
@@ -237,78 +413,144 @@ Sent automatically by NeurasixAI · XLSX report attached.
 }
 
 async function sendEmail({ subject, html, attachments }) {
-  const transporter = nodemailer.createTransport({
-    host: SMTP_SERVER,
-    port: SMTP_PORT,
-    secure: SMTP_PORT === 465,
-    auth: { user: SMTP_USERNAME, pass: SMTP_PASSWORD },
-  });
+  try {
+    log('info', `Preparing to send email to ${TO_EMAIL.length} recipient(s)...`);
+    log('debug', `Recipients: ${TO_EMAIL.join(', ')}`);
+    
+    const transporter = nodemailer.createTransport({
+      host: SMTP_SERVER,
+      port: SMTP_PORT,
+      secure: SMTP_PORT === 465,
+      auth: { user: SMTP_USERNAME, pass: SMTP_PASSWORD },
+    });
 
-  return transporter.sendMail({
-    from: FROM_EMAIL,
-    to: TO_EMAIL,
-    subject,
-    html,
-    attachments,
-  });
+    log('info', 'Sending email...');
+    const info = await transporter.sendMail({
+      from: FROM_EMAIL,
+      to: TO_EMAIL,
+      subject,
+      html,
+      attachments,
+    });
+    
+    log('info', `Email sent successfully! Message ID: ${info.messageId}`);
+    return info;
+  } catch (error) {
+    log('error', `Failed to send email: ${error.message}`);
+    if (error.code) log('error', `Error code: ${error.code}`);
+    throw error;
+  }
 }
 
 async function main() {
-  const windowIST = computeISTWindow();
-  const buckets = parseEnvBuckets() || await listAllBuckets();
+  log('info', '========================================');
+  log('info', '🚀 Starting S3 Daily Summary Process');
+  log('info', '========================================');
+  
+  const startTime = Date.now();
+  
+  try {
+    const windowIST = computeISTWindow();
+    log('info', `Window (IST): ${windowIST.startIST.toFormat('dd LLL yyyy, hh:mm a')} → ${windowIST.endIST.toFormat('dd LLL yyyy, hh:mm a')}`);
+    log('info', `Window (UTC): ${windowIST.startUTC.toFormat('dd LLL yyyy, hh:mm a')} → ${windowIST.endUTC.toFormat('dd LLL yyyy, hh:mm a')}`);
+    
+    const buckets = parseEnvBuckets() || await listAllBuckets();
+    log('info', `Buckets to scan: ${buckets.length} (${buckets.join(', ')})`);
 
-  const perBucketFolderCounts = new Map();
-  const allUploads = [];
+    const perBucketFolderCounts = new Map();
+    const allUploads = [];
+    let totalErrors = 0;
 
-  log('info', `Window (IST): ${windowIST.startIST.toFormat('dd LLL yyyy, hh:mm a')} → ${windowIST.endIST.toFormat('dd LLL yyyy, hh:mm a')}`);
-  log('info', `Buckets to scan: ${buckets.length} (${buckets.join(', ')})`);
+    for (let i = 0; i < buckets.length; i++) {
+      const bucket = buckets[i];
+      log('info', `\n[${i + 1}/${buckets.length}] Scanning bucket: ${bucket}`);
+      
+      try {
+        const { uploads, folderCounts } =
+          await listBucketUploadsInWindow(bucket, windowIST.startUTC, windowIST.endUTC);
+        perBucketFolderCounts.set(bucket, folderCounts);
+        allUploads.push(...uploads.map(u => ({ ...u, Bucket: bucket })));
 
-  for (const bucket of buckets) {
-    log('info', `Scanning bucket: ${bucket} ...`);
-    const { uploads, folderCounts } =
-      await listBucketUploadsInWindow(bucket, windowIST.startUTC, windowIST.endUTC);
-    perBucketFolderCounts.set(bucket, folderCounts);
-    allUploads.push(...uploads.map(u => ({ ...u, Bucket: bucket })));
+        const folderCount = folderCounts.size;
+        const uploadCount = uploads.length;
+        log('info', `✓ [${bucket}] Summary: ${uploadCount} uploads across ${folderCount} folder(s)`);
 
-    const folderCount = folderCounts.size;
-    const uploadCount = uploads.length;
-    log('info', `Found ${uploadCount} uploads across ${folderCount} folder(s) in ${bucket}`);
-
-    if (folderCount > 0) {
-      const top5 = [...folderCounts.entries()]
-        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-        .slice(0, 5)
-        .map(([f, c]) => `${f === '/' ? '/' : f + '/'}: ${c}`)
-        .join(' | ');
-      log('info', `Top folders (${bucket}): ${top5}`);
+        if (folderCount > 0) {
+          const top5 = [...folderCounts.entries()]
+            .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+            .slice(0, 5)
+            .map(([f, c]) => `${f === '/' ? '/' : f + '/'}: ${c}`)
+            .join(' | ');
+          log('info', `  Top folders: ${top5}`);
+        }
+      } catch (error) {
+        totalErrors++;
+        log('error', `✗ [${bucket}] Failed to scan bucket`);
+        log('error', `  Error: ${error.message}`);
+        // Continue with other buckets
+      }
     }
+
+    log('info', '\n========================================');
+    log('info', '📊 Scan Summary');
+    log('info', '========================================');
+    log('info', `Total uploads found: ${allUploads.length}`);
+    log('info', `Buckets successfully scanned: ${perBucketFolderCounts.size}/${buckets.length}`);
+    if (totalErrors > 0) {
+      log('warn', `Buckets with errors: ${totalErrors}`);
+    }
+
+    if (allUploads.length === 0) {
+      log('warn', 'No uploads found in the specified time window!');
+      log('info', 'Skipping report generation and email.');
+      return;
+    }
+
+    const reportsDir = path.join(__dirname, 'reports');
+    const attachmentPath = buildWorkbook(allUploads, perBucketFolderCounts, windowIST, reportsDir);
+
+    log('info', '\nGenerating HTML summary...');
+    const html = buildHtmlSummary(perBucketFolderCounts, windowIST, allUploads.length);
+    log('info', 'HTML summary generated successfully');
+
+    const subject = `Daily S3 Ingestion Summary — ${windowIST.endIST.toFormat('dd LLL yyyy')}`;
+
+    if (DRY_RUN) {
+      log('info', '\n========================================');
+      log('info', '🔍 DRY RUN MODE - No email will be sent');
+      log('info', '========================================');
+      log('info', `Subject: ${subject}`);
+      log('info', `Recipients: ${TO_EMAIL.join(', ')}`);
+      log('info', `Attachment: ${path.basename(attachmentPath)}`);
+      return;
+    }
+
+    log('info', '\n========================================');
+    log('info', '📧 Sending Email');
+    log('info', '========================================');
+    await sendEmail({
+      subject,
+      html,
+      attachments: [{ filename: path.basename(attachmentPath), path: attachmentPath }],
+    });
+
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+    log('info', '\n========================================');
+    log('info', `✅ Process completed successfully in ${elapsed}s`);
+    log('info', '========================================');
+  } catch (error) {
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+    log('error', '\n========================================');
+    log('error', `❌ Process failed after ${elapsed}s`);
+    log('error', '========================================');
+    log('error', `Fatal error: ${error.message}`);
+    log('error', `Stack trace:\n${error.stack}`);
+    throw error;
   }
-
-  const reportsDir = path.join(__dirname, 'reports');
-  const attachmentPath = buildWorkbook(allUploads, perBucketFolderCounts, windowIST, reportsDir);
-  log('info', `Workbook saved: ${attachmentPath}`);
-
-  const html = buildHtmlSummary(perBucketFolderCounts, windowIST, allUploads.length);
-
-  const subject = `Daily S3 Ingestion Summary — ${windowIST.endIST.toFormat('dd LLL yyyy')}`;
-
-  if (DRY_RUN) {
-    log('info', `DRY RUN enabled — skipping email send.`);
-    log('info', `Would email to: ${TO_EMAIL.join(', ')}`);
-    log('info', `Subject: ${subject}`);
-    return;
-  }
-
-  await sendEmail({
-    subject,
-    html,
-    attachments: [{ filename: path.basename(attachmentPath), path: attachmentPath }],
-  });
-
-  log('info', 'Email sent successfully');
 }
 
 main().catch(err => {
-  console.error(err);
+  // Error already logged in main()
+  log('error', '\nExiting with error code 1');
   process.exit(1);
 });
