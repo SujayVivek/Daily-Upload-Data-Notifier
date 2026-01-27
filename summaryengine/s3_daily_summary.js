@@ -62,7 +62,9 @@ const VERBOSE = ARGV.has('--verbose');
 function log(level, msg) {
   if (VERBOSE || level !== 'debug') {
     const ts = DateTime.now().setZone('Asia/Kolkata').toFormat('HH:mm:ss');
-    console.log(`[${ts}] [${level.toUpperCase()}] ${msg}`);
+    const memUsage = process.memoryUsage();
+    const memMB = (memUsage.heapUsed / 1024 / 1024).toFixed(2);
+    console.log(`[${ts}] [${level.toUpperCase()}] [MEM: ${memMB}MB] ${msg}`);
   }
 }
 
@@ -531,18 +533,33 @@ async function main() {
     const reportsDir = path.join(__dirname, 'reports');
     const attachmentPath = buildWorkbook(allUploads, perBucketFolderCounts, windowIST, reportsDir);
 
-    log('info', '\nGenerating file summaries with Claude AI...');
+    log('info', '\n========================================');
+    log('info', '🤖 Generating File Summaries with Claude AI');
+    log('info', '========================================');
+    log('info', `Input file: ${path.basename(attachmentPath)}`);
+    
     let summaryAttachmentPath = null;
     try {
       // Lazy load the module only when needed (after S3 scanning is done)
       const { generateFileSummaries } = require('./generate_file_summaries');
+      log('info', 'Module loaded, starting summary generation...');
+      log('warn', 'This may take a while for large datasets!');
+      
+      const summaryStartTime = Date.now();
       summaryAttachmentPath = await generateFileSummaries(attachmentPath, reportsDir);
+      const summaryTime = ((Date.now() - summaryStartTime) / 1000 / 60).toFixed(1);
+      
       if (summaryAttachmentPath) {
-        log('info', '✓ File summaries generated successfully');
+        log('info', `✓ File summaries generated successfully in ${summaryTime} minutes`);
+        log('info', `Output: ${path.basename(summaryAttachmentPath)}`);
+      } else {
+        log('warn', 'File summaries generation returned null');
       }
     } catch (error) {
       log('error', `Failed to generate file summaries: ${error.message}`);
+      log('error', `Stack trace: ${error.stack}`);
       log('warn', 'Continuing without file summaries attachment');
+      log('info', 'You can retry by running: node generate_file_summaries.js');
     }
 
     log('info', '\nGenerating HTML summary...');
