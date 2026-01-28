@@ -82,6 +82,24 @@ function log(level, msg) {
   console.log(`[${ts}] [${level.toUpperCase()}] ${msg}`);
 }
 
+// Directories to skip for question generation
+const SKIP_DIRECTORIES = [
+  'commercial-case-laws',
+  'usecase-reports-2',
+  'usecase-reports-3',
+  'usecase-reports-4',
+  'usecase-reports-5',
+  'usecase-reports'
+];
+
+function shouldSkipDirectory(directory) {
+  // Check if the directory starts with or contains any of the skip patterns
+  const dirLower = directory.toLowerCase();
+  return SKIP_DIRECTORIES.some(skipDir => 
+    dirLower.includes(skipDir.toLowerCase())
+  );
+}
+
 function readFilesFromExcel(excelPath) {
   log('info', `Reading files from Excel report: ${path.basename(excelPath)}`);
   
@@ -250,24 +268,30 @@ async function processBatch(files, startIndex, endIndex, progressFile, excelPath
     
     let briefing;
     
-    try {
-      const content = await downloadFileContent(file.bucket, file.key);
-      
-      if (!content) {
-        briefing = 'Binary file or unable to read content';
-        log('warn', `  Skipped (binary or unreadable)`);
-      } else {
-        briefing = await generateSummaryWithClaude(file.fileName, file.directory, content);
-        log('info', `  ✓ Question generated successfully`);
+    // Check if directory should be skipped
+    if (shouldSkipDirectory(file.directory)) {
+      briefing = 'Skipped (excluded directory)';
+      log('info', `  ⊘ Skipped - directory excluded from question generation`);
+    } else {
+      try {
+        const content = await downloadFileContent(file.bucket, file.key);
         
-        // Add delay between requests to avoid rate limits
-        if (i < endIndex - 1) {
-          await new Promise(resolve => setTimeout(resolve, 3000));
+        if (!content) {
+          briefing = 'Binary file or unable to read content';
+          log('warn', `  Skipped (binary or unreadable)`);
+        } else {
+          briefing = await generateSummaryWithClaude(file.fileName, file.directory, content);
+          log('info', `  ✓ Question generated successfully`);
+          
+          // Add delay between requests to avoid rate limits
+          if (i < endIndex - 1) {
+            await new Promise(resolve => setTimeout(resolve, 3000));
+          }
         }
+      } catch (error) {
+        log('error', `  Error processing file: ${error.message}`);
+        briefing = `Error: ${error.message}`;
       }
-    } catch (error) {
-      log('error', `  Error processing file: ${error.message}`);
-      briefing = `Error: ${error.message}`;
     }
     
     summaries.push({

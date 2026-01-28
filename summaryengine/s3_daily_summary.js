@@ -533,35 +533,6 @@ async function main() {
     const reportsDir = path.join(__dirname, 'reports');
     const attachmentPath = buildWorkbook(allUploads, perBucketFolderCounts, windowIST, reportsDir);
 
-    log('info', '\n========================================');
-    log('info', '🤖 Generating File Summaries with Claude AI');
-    log('info', '========================================');
-    log('info', `Input file: ${path.basename(attachmentPath)}`);
-    
-    let summaryAttachmentPath = null;
-    try {
-      // Lazy load the module only when needed (after S3 scanning is done)
-      const { generateFileSummaries } = require('./generate_file_summaries');
-      log('info', 'Module loaded, starting summary generation...');
-      log('warn', 'This may take a while for large datasets!');
-      
-      const summaryStartTime = Date.now();
-      summaryAttachmentPath = await generateFileSummaries(attachmentPath, reportsDir);
-      const summaryTime = ((Date.now() - summaryStartTime) / 1000 / 60).toFixed(1);
-      
-      if (summaryAttachmentPath) {
-        log('info', `✓ File summaries generated successfully in ${summaryTime} minutes`);
-        log('info', `Output: ${path.basename(summaryAttachmentPath)}`);
-      } else {
-        log('warn', 'File summaries generation returned null');
-      }
-    } catch (error) {
-      log('error', `Failed to generate file summaries: ${error.message}`);
-      log('error', `Stack trace: ${error.stack}`);
-      log('warn', 'Continuing without file summaries attachment');
-      log('info', 'You can retry by running: node generate_file_summaries.js');
-    }
-
     log('info', '\nGenerating HTML summary...');
     const html = buildHtmlSummary(perBucketFolderCounts, windowIST, allUploads.length);
     log('info', 'HTML summary generated successfully');
@@ -575,9 +546,6 @@ async function main() {
       log('info', `Subject: ${subject}`);
       log('info', `Recipients: ${TO_EMAIL.join(', ')}`);
       log('info', `Attachment: ${path.basename(attachmentPath)}`);
-      if (summaryAttachmentPath) {
-        log('info', `Attachment: ${path.basename(summaryAttachmentPath)}`);
-      }
       return;
     }
 
@@ -585,23 +553,12 @@ async function main() {
     log('info', '📧 Sending Email');
     log('info', '========================================');
     
-    // Prepare attachments array
-    const attachments = [
-      { filename: path.basename(attachmentPath), path: attachmentPath }
-    ];
-    
-    // Add file summaries if available
-    if (summaryAttachmentPath) {
-      attachments.push({ 
-        filename: path.basename(summaryAttachmentPath), 
-        path: summaryAttachmentPath 
-      });
-    }
-    
     await sendEmail({
       subject,
       html,
-      attachments,
+      attachments: [
+        { filename: path.basename(attachmentPath), path: attachmentPath }
+      ],
     });
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
