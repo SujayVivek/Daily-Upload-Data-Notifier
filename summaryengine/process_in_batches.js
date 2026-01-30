@@ -442,7 +442,31 @@ async function main() {
   const files = readFilesFromExcel(latestReport);
   
   if (files.length === 0) {
-    log('warn', 'No files to process');
+    log('warn', 'No files to process - creating empty summary report');
+    
+    // Create empty summary file and send email anyway
+    const inputFilename = path.basename(latestReport);
+    const dateMatch = inputFilename.match(/(\d{8})/);
+    const dateStr = dateMatch ? dateMatch[1] : DateTime.now().setZone('Asia/Kolkata').toFormat('yyyyLLdd');
+    
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.json_to_sheet([]);
+    XLSX.utils.book_append_sheet(wb, ws, 'File Summaries');
+    
+    const summaryFilename = `file_summaries_${dateStr}.xlsx`;
+    const summaryPath = path.join(reportsDir, summaryFilename);
+    XLSX.writeFile(wb, summaryPath);
+    
+    log('info', `✓ Empty summary report created: ${summaryFilename}`);
+    
+    // Send email with both attachments
+    await sendEmail(summaryPath, latestReport);
+    
+    log('info', '\n========================================');
+    log('info', '✅ PROCESS COMPLETE (0 files processed)');
+    log('info', '========================================');
+    log('info', `Email sent: Yes`);
+    log('info', '========================================');
     return;
   }
   

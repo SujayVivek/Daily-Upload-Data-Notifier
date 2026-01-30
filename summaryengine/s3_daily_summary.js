@@ -526,8 +526,7 @@ async function main() {
 
     if (allUploads.length === 0) {
       log('warn', 'No uploads found in the specified time window!');
-      log('info', 'Skipping report generation and email.');
-      return;
+      log('info', 'Continuing to generate report with 0 uploads...');
     }
 
     const reportsDir = path.join(__dirname, 'reports');
