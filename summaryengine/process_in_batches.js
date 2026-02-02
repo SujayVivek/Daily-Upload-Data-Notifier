@@ -2,8 +2,10 @@
 /**
  * Batch Processing Orchestrator
  * 
- * This script processes files in batches of 50 using generate_file_summaries.js logic.
- * After each batch of 50 files, it stops and restarts with the next batch.
+ * This script processes files in batches of 25 using Claude AI to generate:
+ * 1. A highly specific question about each document
+ * 2. A 4-5 line summary of each document's content
+ * After each batch, it saves progress and continues with the next batch.
  * Once all files are processed, it sends the email automatically.
  */
 
@@ -82,7 +84,7 @@ function log(level, msg) {
   console.log(`[${ts}] [${level.toUpperCase()}] ${msg}`);
 }
 
-// Directories to skip for question generation
+// Directories to skip for question and summary generation
 const SKIP_DIRECTORIES = [
   'commercial-case-laws',
   'usecase-reports-2',
@@ -174,7 +176,7 @@ async function downloadFileContent(bucket, key, maxSize = 500000) {
   }
 }
 
-async function generateSummaryWithClaude(fileName, directory, fileContent, retries = 3) {
+async function generateQuestionWithClaude(fileName, directory, fileContent, retries = 3) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const contentPreview = fileContent.slice(0, 10000);
@@ -217,7 +219,7 @@ Generate ONE specific question only. Do not provide any preamble or explanation.
       
       return cleanQuestion;
     } catch (error) {
-      log('error', `Claude API error (attempt ${attempt}/${retries}): ${error.message}`);
+      log('error', `Claude API error for question (attempt ${attempt}/${retries}): ${error.message}`);
       
       // Rate limiting - wait longer before retry
       if (error.status === 429 && attempt < retries) {
@@ -234,6 +236,74 @@ Generate ONE specific question only. Do not provide any preamble or explanation.
       }
       
       return 'Error generating question (API failure after retries)';
+    }
+  }
+}
+
+async function generateSummaryWithClaude(fileName, directory, fileContent, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const contentPreview = fileContent.slice(0, 10000);
+      
+      const prompt = `You are analyzing a legal/financial/regulatory document. Your task is to provide a concise 4-5 line summary of this document's content.
+
+File: ${fileName}
+
+Content:
+${contentPreview}
+
+INSTRUCTIONS:
+1. Read and understand the entire document content provided above.
+
+2. Provide a clear, concise summary of the document in 4-5 lines that covers:
+   - The main subject/topic of the document
+   - Key findings, decisions, or conclusions
+   - Important facts or details
+   - Overall purpose or outcome
+
+3. If the document is in a foreign language (non-English), first understand the content in that language, then provide your summary IN ENGLISH ONLY.
+
+4. If the file appears to be a scanned PDF or image-based document where text is not fully extractable, provide a summary based on whatever content is visible.
+
+Your summary should be:
+- 4-5 lines maximum
+- Clear and informative
+- Written in English regardless of the document's language
+- Focus on the most important aspects of the document
+
+Provide ONLY the summary without any preamble or explanation.`;
+
+      const message = await anthropic.messages.create({
+        model: 'claude-3-haiku-20240307',
+        max_tokens: 300,
+        temperature: 0.3,
+        messages: [{
+          role: 'user',
+          content: prompt,
+        }],
+      });
+
+      const summary = message.content[0].text.trim();
+      
+      return summary;
+    } catch (error) {
+      log('error', `Claude API error for summary (attempt ${attempt}/${retries}): ${error.message}`);
+      
+      // Rate limiting - wait longer before retry
+      if (error.status === 429 && attempt < retries) {
+        const waitTime = attempt * 10000;
+        log('warn', `Rate limited! Waiting ${waitTime/1000}s before retry...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+        continue;
+      }
+      
+      // Other errors - shorter wait before retry
+      if (attempt < retries) {
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        continue;
+      }
+      
+      return 'Error generating summary (API failure after retries)';
     }
   }
 }
@@ -266,38 +336,51 @@ async function processBatch(files, startIndex, endIndex, progressFile, excelPath
     log('info', `\n[${fileNum}/${files.length}] (${percentComplete}%) Processing: ${file.fileName}`);
     log('info', `  Directory: ${file.directory}`);
     
-    let briefing;
+    let question;
+    let summary;
     
     // Check if directory should be skipped
     if (shouldSkipDirectory(file.directory)) {
-      briefing = 'Skipped (excluded directory)';
-      log('info', `  ⊘ Skipped - directory excluded from question generation`);
+      question = 'Skipped (excluded directory)';
+      summary = 'Skipped (excluded directory)';
+      log('info', `  ⊘ Skipped - directory excluded from question/summary generation`);
     } else {
       try {
         const content = await downloadFileContent(file.bucket, file.key);
         
         if (!content) {
-          briefing = 'Binary file or unable to read content';
+          question = 'Binary file or unable to read content';
+          summary = 'Binary file or unable to read content';
           log('warn', `  Skipped (binary or unreadable)`);
         } else {
-          briefing = await generateSummaryWithClaude(file.fileName, file.directory, content);
+          // Generate question first
+          question = await generateQuestionWithClaude(file.fileName, file.directory, content);
           log('info', `  ✓ Question generated successfully`);
           
           // Add delay between requests to avoid rate limits
+          await new Promise(resolve => setTimeout(resolve, 3000));
+          
+          // Generate summary
+          summary = await generateSummaryWithClaude(file.fileName, file.directory, content);
+          log('info', `  ✓ Summary generated successfully`);
+          
+          // Add delay before next file
           if (i < endIndex - 1) {
             await new Promise(resolve => setTimeout(resolve, 3000));
           }
         }
       } catch (error) {
         log('error', `  Error processing file: ${error.message}`);
-        briefing = `Error: ${error.message}`;
+        question = `Error: ${error.message}`;
+        summary = `Error: ${error.message}`;
       }
     }
     
     summaries.push({
       'File Name': file.fileName,
       'File Directory': file.directory,
-      'Question Generated by LLM': briefing,
+      'Question Generated by LLM': question,
+      'Summary Generated by LLM': summary,
     });
     
     // Save progress every 10 files
@@ -473,7 +556,7 @@ async function main() {
   log('info', `Total files to process: ${files.length}`);
   const numBatches = Math.ceil(files.length / BATCH_SIZE);
   log('info', `Will process in ${numBatches} batches of ${BATCH_SIZE} files each`);
-  log('info', `Estimated time: ${(files.length * 3 / 60).toFixed(1)} minutes`);
+  log('info', `Estimated time: ${(files.length * 6 / 60).toFixed(1)} minutes (2 API calls per file)`);
   
   // Process all batches
   let allSummaries = [];
@@ -507,9 +590,10 @@ async function main() {
   const ws = XLSX.utils.json_to_sheet(allSummaries);
   
   ws['!cols'] = [
-    { wch: 30 },
-    { wch: 50 },
-    { wch: 100 },
+    { wch: 30 },  // File Name
+    { wch: 50 },  // File Directory
+    { wch: 80 },  // Question Generated by LLM
+    { wch: 100 }, // Summary Generated by LLM
   ];
   
   XLSX.utils.book_append_sheet(wb, ws, 'File Summaries');
