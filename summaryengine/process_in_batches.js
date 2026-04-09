@@ -3,8 +3,7 @@
  * Batch Processing Orchestrator
  * 
  * This script processes files in batches of 25 using Claude AI to generate:
- * 1. A highly specific question about each document
- * 2. A 4-5 line summary of each document's content
+ * 1. A highly specific summary of each document's content
  * After each batch, it saves progress and continues with the next batch.
  * Once all files are processed, it sends the email automatically.
  */
@@ -78,6 +77,8 @@ const s3 = new S3Client({
 const anthropic = new Anthropic({
   apiKey: CLAUDE_API_KEY,
 });
+
+const CLAUDE_MODEL = 'claude-3-5-sonnet-20240620';
 
 function log(level, msg) {
   const ts = DateTime.now().setZone('Asia/Kolkata').toFormat('HH:mm:ss');
@@ -176,107 +177,55 @@ async function downloadFileContent(bucket, key, maxSize = 500000) {
   }
 }
 
-async function generateQuestionWithClaude(fileName, directory, fileContent, retries = 3) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const contentPreview = fileContent.slice(0, 10000);
-      
-      const prompt = `You are analyzing a legal/financial/regulatory document. Your task is to generate ONE highly specific question about this document's content.
-
-File: ${fileName}
-
-Content:
-${contentPreview}
-
-INSTRUCTIONS:
-1. If the text is clearly readable and extractable (like the content provided above), generate a highly specific question based on the extracted text.
-
-2. If the file appears to be a scanned PDF or image-based document where text is not extractable, you should still analyze whatever content is visible and generate a highly specific question about what you can perceive from the document.
-
-3. If the document is in a foreign language (non-English), first understand the content in that language, then generate your question IN ENGLISH ONLY about the document's content.
-
-Your question should be:
-- HIGHLY SPECIFIC to this particular document
-- Focus on key facts, findings, decisions, or conclusions
-- Be clear and concise (one sentence)
-- Written in English regardless of the document's language
-- Answerable by someone who has read this document
-
-Generate ONE specific question only. Do not provide any preamble or explanation.`;
-
-      const message = await anthropic.messages.create({
-        model: 'claude-3-haiku-20240307',
-        max_tokens: 150,
-        temperature: 0.3,
-        messages: [{
-          role: 'user',
-          content: prompt,
-        }],
-      });
-
-      const question = message.content[0].text.trim();
-      const cleanQuestion = question.replace(/^\d+\.\s*/, '').trim();
-      
-      return cleanQuestion;
-    } catch (error) {
-      log('error', `Claude API error for question (attempt ${attempt}/${retries}): ${error.message}`);
-      
-      // Rate limiting - wait longer before retry
-      if (error.status === 429 && attempt < retries) {
-        const waitTime = attempt * 10000;
-        log('warn', `Rate limited! Waiting ${waitTime/1000}s before retry...`);
-        await new Promise(resolve => setTimeout(resolve, waitTime));
-        continue;
-      }
-      
-      // Other errors - shorter wait before retry
-      if (attempt < retries) {
-        await new Promise(resolve => setTimeout(resolve, 5000));
-        continue;
-      }
-      
-      return 'Error generating question (API failure after retries)';
-    }
-  }
-}
-
 async function generateSummaryWithClaude(fileName, directory, fileContent, retries = 3) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const contentPreview = fileContent.slice(0, 10000);
       
-      const prompt = `You are analyzing a legal/financial/regulatory document. Your task is to provide a concise 4-5 line summary of this document's content.
+        const prompt = `You are a domain analyst summarizing one source document for downstream retrieval and decision support.
 
 File: ${fileName}
+    Directory: ${directory}
 
 Content:
 ${contentPreview}
 
 INSTRUCTIONS:
-1. Read and understand the entire document content provided above.
+  1. Read the provided text and summarize ONLY what is explicitly present.
+  2. Write EXACTLY 5 bullet lines, each starting with "- ".
+  3. Every bullet must contain at least one concrete anchor from the text, such as:
+       - a date, period, section/article/circular/notification number
+       - a named party/authority/court/body
+       - a numeric value, threshold, rate, penalty, amount, or count
+       - a specific action/outcome (approved/rejected/amended/exempted/liable/etc.)
+  4. Start each bullet directly with concrete content from the file. Do NOT start with generic framing like "This document", "The document", "It", or "This appears to be".
+    4. Capture these 5 angles in order:
+       - Main issue and scope of the document
+       - Key decision/change/finding
+       - Critical quantitative or legal details (rates, limits, dates, clauses)
+       - Applicability (who is affected, from when, conditions/exceptions)
+       - Practical impact or compliance consequence
+    5. If the text states that earlier circulars/notifications/orders are amended/superseded/withdrawn, mention the exact references and what changed.
+    6. If the document is not in English, understand it first and output in English.
+    7. If extraction is weak (e.g., scanned PDF), use only visible facts and state this clearly in one bullet with whatever concrete clues are present.
 
-2. Provide a clear, concise summary of the document in 4-5 lines that covers:
-   - The main subject/topic of the document
-   - Key findings, decisions, or conclusions
-   - Important facts or details
-   - Overall purpose or outcome
+    STRICTLY FORBIDDEN:
+    - Generic openers like "This document appears to be" or "The document provides details".
+    - Any phrasing that hedges or guesses ("appears", "seems", "likely", "possibly").
+    - Vague statements without concrete facts.
+    - Invented facts or assumptions.
 
-3. If the document is in a foreign language (non-English), first understand the content in that language, then provide your summary IN ENGLISH ONLY.
-
-4. If the file appears to be a scanned PDF or image-based document where text is not fully extractable, provide a summary based on whatever content is visible.
-
-Your summary should be:
-- 4-5 lines maximum
-- Clear and informative
-- Written in English regardless of the document's language
-- Focus on the most important aspects of the document
-
-Provide ONLY the summary without any preamble or explanation.`;
+    OUTPUT FORMAT:
+    - Exactly 5 bullet points
+    - English only
+    - No heading, no preamble, no markdown except the bullet marker
+    - Keep each bullet to 1 sentence
+    `;
 
       const message = await anthropic.messages.create({
-        model: 'claude-3-haiku-20240307',
-        max_tokens: 300,
-        temperature: 0.3,
+        model: CLAUDE_MODEL,
+        max_tokens: 400,
+        temperature: 0.2,
         messages: [{
           role: 'user',
           content: prompt,
@@ -288,18 +237,21 @@ Provide ONLY the summary without any preamble or explanation.`;
       return summary;
     } catch (error) {
       log('error', `Claude API error for summary (attempt ${attempt}/${retries}): ${error.message}`);
+      if (error.status) log('error', `  HTTP Status: ${error.status}`);
       
-      // Rate limiting - wait longer before retry
+      // Rate limiting - exponential backoff
       if (error.status === 429 && attempt < retries) {
-        const waitTime = attempt * 10000;
-        log('warn', `Rate limited! Waiting ${waitTime/1000}s before retry...`);
+        const waitTime = Math.min(attempt * 15000, 60000); // Max 60s
+        log('warn', `⚠️  Rate limited! Waiting ${waitTime/1000}s before retry...`);
         await new Promise(resolve => setTimeout(resolve, waitTime));
         continue;
       }
       
-      // Other errors - shorter wait before retry
+      // Other errors - wait before retry
       if (attempt < retries) {
-        await new Promise(resolve => setTimeout(resolve, 5000));
+        const waitTime = 8000;
+        log('warn', `  Retrying in ${waitTime/1000}s...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
         continue;
       }
       
@@ -308,11 +260,41 @@ Provide ONLY the summary without any preamble or explanation.`;
   }
 }
 
+// Helper function to save summaries to Excel immediately
+function saveSummariesToExcel(summaries, excelPath, reportsDir) {
+  try {
+    const inputFilename = path.basename(excelPath);
+    const dateMatch = inputFilename.match(/(\d{8})/);
+    const dateStr = dateMatch ? dateMatch[1] : DateTime.now().setZone('Asia/Kolkata').toFormat('yyyyLLdd');
+    
+    const summaryFilename = `file_summaries_${dateStr}.xlsx`;
+    const summaryPath = path.join(reportsDir, summaryFilename);
+    
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.json_to_sheet(summaries);
+    
+    ws['!cols'] = [
+      { wch: 30 },  // File Name
+      { wch: 50 },  // File Directory
+      { wch: 120 }, // Summary Generated by LLM
+    ];
+    
+    XLSX.utils.book_append_sheet(wb, ws, 'File Summaries');
+    XLSX.writeFile(wb, summaryPath);
+    
+    return summaryPath;
+  } catch (error) {
+    log('error', `Failed to save Excel: ${error.message}`);
+    return null;
+  }
+}
+
 async function processBatch(files, startIndex, endIndex, progressFile, excelPath) {
   log('info', `\n========================================`);
   log('info', `Processing batch: Files ${startIndex + 1} to ${endIndex}`);
   log('info', `========================================`);
   
+  const reportsDir = path.join(__dirname, 'reports');
   const summaries = [];
   
   // Load existing progress if available
@@ -335,43 +317,51 @@ async function processBatch(files, startIndex, endIndex, progressFile, excelPath
     
     log('info', `\n[${fileNum}/${files.length}] (${percentComplete}%) Processing: ${file.fileName}`);
     log('info', `  Directory: ${file.directory}`);
+    log('info', `  Bucket: ${file.bucket}`);
+    log('info', `  Size: ${(file.size / 1024).toFixed(2)} KB`);
     
-    let question;
     let summary;
+    let skippedReason = null;
     
     // Check if directory should be skipped
     if (shouldSkipDirectory(file.directory)) {
-      question = 'Skipped (excluded directory)';
       summary = 'Skipped (excluded directory)';
-      log('info', `  ⊘ Skipped - directory excluded from question/summary generation`);
+      skippedReason = `Directory matches exclusion pattern: ${file.directory}`;
+      log('warn', `  ⛔ SKIPPED: ${skippedReason}`);
     } else {
       try {
         const content = await downloadFileContent(file.bucket, file.key);
         
         if (!content) {
-          question = 'Binary file or unable to read content';
           summary = 'Binary file or unable to read content';
-          log('warn', `  Skipped (binary or unreadable)`);
+          skippedReason = 'File is binary or content could not be extracted';
+          log('warn', `  ⛔ SKIPPED: ${skippedReason}`);
         } else {
-          // Generate question first
-          question = await generateQuestionWithClaude(file.fileName, file.directory, content);
-          log('info', `  ✓ Question generated successfully`);
-          
-          // Add delay between requests to avoid rate limits
-          await new Promise(resolve => setTimeout(resolve, 3000));
-          
           // Generate summary
+          log('debug', `  Calling Claude API for summary...`);
           summary = await generateSummaryWithClaude(file.fileName, file.directory, content);
           log('info', `  ✓ Summary generated successfully`);
           
-          // Add delay before next file
+          // Log memory usage periodically
+          if (fileNum % 50 === 0) {
+            const memUsage = process.memoryUsage();
+            const memMB = (memUsage.heapUsed / 1024 / 1024).toFixed(2);
+            log('info', `  📊 Memory: ${memMB} MB heap used`);
+          }
+          
+          // Base delay before next file (increased to 5s)
           if (i < endIndex - 1) {
-            await new Promise(resolve => setTimeout(resolve, 3000));
+            await new Promise(resolve => setTimeout(resolve, 5000));
+          }
+          
+          // Extra cooldown every 20 files to prevent rate limit buildup
+          if (fileNum % 20 === 0 && i < endIndex - 1) {
+            log('info', `  🕐 Cooldown: Waiting 8s after ${fileNum} files...`);
+            await new Promise(resolve => setTimeout(resolve, 8000));
           }
         }
       } catch (error) {
         log('error', `  Error processing file: ${error.message}`);
-        question = `Error: ${error.message}`;
         summary = `Error: ${error.message}`;
       }
     }
@@ -379,23 +369,29 @@ async function processBatch(files, startIndex, endIndex, progressFile, excelPath
     summaries.push({
       'File Name': file.fileName,
       'File Directory': file.directory,
-      'Question Generated by LLM': question,
       'Summary Generated by LLM': summary,
     });
     
-    // Save progress every 10 files
-    if (fileNum % 10 === 0) {
-      try {
-        fs.writeFileSync(progressFile, JSON.stringify({
-          excelPath: excelPath,
-          summaries: summaries,
-          lastProcessed: fileNum,
-          timestamp: new Date().toISOString()
-        }, null, 2));
-        log('info', `  Progress saved (${fileNum} files)`);
-      } catch (err) {
-        log('error', `  Failed to save progress: ${err.message}`);
+    // Save to Excel file IMMEDIATELY after each file (crash-safe)
+    try {
+      const savedPath = saveSummariesToExcel(summaries, excelPath, reportsDir);
+      if (savedPath && fileNum % 10 === 0) {
+        log('info', `  💾 Excel saved: ${fileNum}/${files.length} files`);
       }
+    } catch (err) {
+      log('error', `  Failed to save Excel: ${err.message}`);
+    }
+    
+    // Also save progress JSON for tracking
+    try {
+      fs.writeFileSync(progressFile, JSON.stringify({
+        excelPath: excelPath,
+        summaries: summaries,
+        lastProcessed: fileNum,
+        timestamp: new Date().toISOString()
+      }, null, 2));
+    } catch (err) {
+      log('error', `  Failed to save progress JSON: ${err.message}`);
     }
   }
   
@@ -495,8 +491,13 @@ async function main() {
   log('info', '========================================');
   log('info', '🚀 Batch Processing Orchestrator Started');
   log('info', '========================================');
+  log('info', `Process ID: ${process.pid}`);
+  log('info', `Node version: ${process.version}`);
+  log('info', `Platform: ${process.platform}`);
   log('info', `Batch size: ${BATCH_SIZE} files`);
   log('info', `Start time: ${DateTime.now().setZone('Asia/Kolkata').toFormat('dd LLL yyyy, HH:mm:ss')}`);
+  log('info', `Working directory: ${__dirname}`);
+  log('info', '========================================');
   
   const startTime = Date.now();
   const reportsDir = path.join(__dirname, 'reports');
@@ -556,57 +557,78 @@ async function main() {
   log('info', `Total files to process: ${files.length}`);
   const numBatches = Math.ceil(files.length / BATCH_SIZE);
   log('info', `Will process in ${numBatches} batches of ${BATCH_SIZE} files each`);
-  log('info', `Estimated time: ${(files.length * 6 / 60).toFixed(1)} minutes (2 API calls per file)`);
+  log('info', `Estimated time: ${(files.length * 3 / 60).toFixed(1)} minutes (1 API call per file)`);
   
-  // Process all batches
-  let allSummaries = [];
-  
-  for (let batchNum = 0; batchNum < numBatches; batchNum++) {
-    const startIndex = batchNum * BATCH_SIZE;
-    const endIndex = Math.min(startIndex + BATCH_SIZE, files.length);
-    
-    log('info', `\n========================================`);
-    log('info', `📦 Batch ${batchNum + 1}/${numBatches}`);
-    log('info', `========================================`);
-    
-    allSummaries = await processBatch(files, startIndex, endIndex, progressFile, latestReport);
-    
-    log('info', `✓ Batch ${batchNum + 1}/${numBatches} complete!`);
-    log('info', `Total summaries generated so far: ${allSummaries.length}/${files.length}`);
-    
-    // Brief pause between batches
-    if (batchNum < numBatches - 1) {
-      log('info', `Pausing 5 seconds before next batch...`);
-      await new Promise(resolve => setTimeout(resolve, 5000));
-    }
-  }
-  
-  // All batches complete - create final Excel file
-  log('info', '\n========================================');
-  log('info', '📊 Creating Final Summary Report');
-  log('info', '========================================');
-  
-  const wb = XLSX.utils.book_new();
-  const ws = XLSX.utils.json_to_sheet(allSummaries);
-  
-  ws['!cols'] = [
-    { wch: 30 },  // File Name
-    { wch: 50 },  // File Directory
-    { wch: 80 },  // Question Generated by LLM
-    { wch: 100 }, // Summary Generated by LLM
-  ];
-  
-  XLSX.utils.book_append_sheet(wb, ws, 'File Summaries');
-  
+  // Determine summary file path upfront
   const inputFilename = path.basename(latestReport);
   const dateMatch = inputFilename.match(/(\d{8})/);
   const dateStr = dateMatch ? dateMatch[1] : DateTime.now().setZone('Asia/Kolkata').toFormat('yyyyLLdd');
-  
   const summaryFilename = `file_summaries_${dateStr}.xlsx`;
   const summaryPath = path.join(reportsDir, summaryFilename);
   
-  XLSX.writeFile(wb, summaryPath);
-  log('info', `✓ Summary report created: ${summaryFilename}`);
+  // Process all batches with crash protection
+  let allSummaries = [];
+  let processingError = null;
+  
+  try {
+    for (let batchNum = 0; batchNum < numBatches; batchNum++) {
+      const startIndex = batchNum * BATCH_SIZE;
+      const endIndex = Math.min(startIndex + BATCH_SIZE, files.length);
+      
+      log('info', `\n========================================`);
+      log('info', `📦 Batch ${batchNum + 1}/${numBatches}`);
+      log('info', `========================================`);
+      
+      allSummaries = await processBatch(files, startIndex, endIndex, progressFile, latestReport);
+      
+      log('info', `✓ Batch ${batchNum + 1}/${numBatches} complete!`);
+      log('info', `Total summaries generated so far: ${allSummaries.length}/${files.length}`);
+      
+      // Brief pause between batches
+      if (batchNum < numBatches - 1) {
+        log('info', `Pausing 5 seconds before next batch...`);
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      }
+    }
+    
+    log('info', '\n✅ All batches completed successfully!');
+  } catch (error) {
+    processingError = error;
+    log('error', `\n❌ Processing stopped due to error: ${error.message}`);
+    log('warn', `⚠️  Will send email with ${allSummaries.length} summaries generated before crash`);
+  }
+  
+  // ALWAYS try to send email with whatever summaries we have
+  log('info', '\n========================================');
+  log('info', '📧 Preparing to send email');
+  log('info', '========================================');
+  
+  // Check if Excel file already exists (saved during processing)
+  let emailSent = false;
+  if (fs.existsSync(summaryPath)) {
+    log('info', `✓ Summary file already exists: ${summaryFilename}`);
+    log('info', `  Contains ${allSummaries.length} summaries`);
+  } else if (allSummaries.length > 0) {
+    log('info', '📊 Creating final summary report...');
+    try {
+      const wb = XLSX.utils.book_new();
+      const ws = XLSX.utils.json_to_sheet(allSummaries);
+      
+      ws['!cols'] = [
+        { wch: 30 },  // File Name
+        { wch: 50 },  // File Directory
+        { wch: 120 }, // Summary Generated by LLM
+      ];
+      
+      XLSX.utils.book_append_sheet(wb, ws, 'File Summaries');
+      XLSX.writeFile(wb, summaryPath);
+      log('info', `✓ Summary report created: ${summaryFilename}`);
+    } catch (excelError) {
+      log('error', `Failed to create Excel: ${excelError.message}`);
+    }
+  } else {
+    log('warn', '⚠️  No summaries to send!');
+  }
   
   // Clean up progress file
   if (fs.existsSync(progressFile)) {
@@ -618,22 +640,85 @@ async function main() {
     }
   }
   
-  // Send email with both attachments
-  const emailSent = await sendEmail(summaryPath, latestReport);
+  // Send email if we have a valid summary file
+  if (fs.existsSync(summaryPath)) {
+    try {
+      emailSent = await sendEmail(summaryPath, latestReport);
+      if (!emailSent) {
+        log('error', '❌ Email sending returned false');
+      }
+    } catch (emailError) {
+      log('error', `❌ Email sending failed: ${emailError.message}`);
+      emailSent = false;
+    }
+  } else {
+    log('error', `❌ Cannot send email - summary file does not exist: ${summaryPath}`);
+  }
   
   const totalTime = ((Date.now() - startTime) / 1000 / 60).toFixed(1);
   
+  // Count skipped files
+  const skippedFiles = allSummaries.filter(s => 
+    s['Summary Generated by LLM'].startsWith('Skipped') || 
+    s['Summary Generated by LLM'].startsWith('Binary') ||
+    s['Summary Generated by LLM'].startsWith('Error')
+  ).length;
+  const processedFiles = allSummaries.length - skippedFiles;
+  
   log('info', '\n========================================');
-  log('info', '✅ PROCESS COMPLETE!');
+  if (processingError) {
+    log('warn', '⚠️  PROCESS COMPLETED WITH ERRORS');
+    log('warn', `Error: ${processingError.message}`);
+  } else {
+    log('info', '✅ PROCESS COMPLETE!');
+  }
   log('info', '========================================');
-  log('info', `Total files processed: ${allSummaries.length}`);
+  log('info', `Total files in report: ${files.length}`);
+  log('info', `Files processed: ${allSummaries.length}/${files.length}`);
+  log('info', `Successfully generated summaries: ${processedFiles}`);
+  log('info', `Skipped/Failed: ${skippedFiles}`);
   log('info', `Total time: ${totalTime} minutes`);
-  log('info', `Email sent: ${emailSent ? 'Yes' : 'No'}`);
+  log('info', `Email sent: ${emailSent ? 'Yes ✓' : 'No ✗'}`);
   log('info', `End time: ${DateTime.now().setZone('Asia/Kolkata').toFormat('dd LLL yyyy, HH:mm:ss')}`);
   log('info', '========================================');
+  
+  // Exit with error code if processing failed but still sent email
+  if (processingError && emailSent) {
+    log('info', '📧 Email sent successfully despite processing errors');
+  } else if (processingError) {
+    throw processingError; // Re-throw to trigger catch block
+  }
 }
 
 // Run the main function
+process.on('uncaughtException', (error) => {
+  log('error', `\n❌❌❌ UNCAUGHT EXCEPTION ❌❌❌`);
+  log('error', `Error: ${error.message}`);
+  log('error', `Stack: ${error.stack}`);
+  log('error', `Process will attempt to save progress and send email before exiting...`);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  log('error', `\n❌❌❌ UNHANDLED PROMISE REJECTION ❌❌❌`);
+  log('error', `Reason: ${reason}`);
+  log('error', `Promise: ${promise}`);
+  log('error', `Process will attempt to save progress and send email before exiting...`);
+  process.exit(1);
+});
+
+process.on('SIGINT', () => {
+  log('warn', `\n⚠️  Process interrupted by user (Ctrl+C)`);
+  log('warn', `Progress has been saved. Run again to resume.`);
+  process.exit(130);
+});
+
+process.on('SIGTERM', () => {
+  log('warn', `\n⚠️  Process terminated by system`);
+  log('warn', `Progress has been saved. Run again to resume.`);
+  process.exit(143);
+});
+
 main().catch(err => {
   log('error', `Fatal error: ${err.message}`);
   log('error', `Stack: ${err.stack}`);
