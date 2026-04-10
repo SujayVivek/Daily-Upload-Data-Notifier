@@ -11,6 +11,13 @@ const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 const AWS_ACCESS_KEY_ID = process.env.AWS_ACCESS_KEY_ID;
 const AWS_SECRET_ACCESS_KEY = process.env.AWS_SECRET_ACCESS_KEY;
 const S3_BUCKETS_RAW = process.env.S3_BUCKETS;
+const MAIL_ENABLED = process.env.MAIL_ENABLED === 'true';
+const MAIL_SMTP_HOST = process.env.MAIL_SMTP_HOST || 'smtp.zoho.com';
+const MAIL_SMTP_PORT = Number(process.env.MAIL_SMTP_PORT || 465);
+const MAIL_SMTP_USE_SSL = process.env.MAIL_SMTP_USE_SSL === 'true';
+const MAIL_FROM_EMAIL = process.env.MAIL_FROM_EMAIL;
+const MAIL_USERNAME = process.env.MAIL_USERNAME;
+const MAIL_PASSWORD = process.env.MAIL_PASSWORD;
 
 function parseEnvEmails(raw) {
   if (!raw) return [];
@@ -47,13 +54,9 @@ function parseEnvEmails(raw) {
     .filter(Boolean);
 }
 
-const TO_EMAIL = parseEnvEmails(process.env.TO_EMAIL || '');
-
-const FROM_EMAIL = process.env.FROM_EMAIL || process.env.SMTP_USERNAME;
-const SMTP_SERVER = process.env.SMTP_SERVER || 'smtp.gmail.com';
-const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
-const SMTP_USERNAME = process.env.SMTP_USERNAME;
-const SMTP_PASSWORD = process.env.SMTP_PASSWORD;
+const TO_EMAIL = parseEnvEmails(process.env.MAIL_TO || process.env.TO_EMAIL || '');
+const CC_EMAIL = parseEnvEmails(process.env.MAIL_CC || '');
+const BCC_EMAIL = parseEnvEmails(process.env.MAIL_BCC || '');
 
 const DRY_RUN = process.argv.includes('--dry');
 const ARGV = new Set(process.argv.slice(2));
@@ -73,7 +76,7 @@ if (!AWS_ACCESS_KEY_ID || !AWS_SECRET_ACCESS_KEY) {
   process.exit(1);
 }
 
-if (!FROM_EMAIL || TO_EMAIL.length === 0) {
+if (!MAIL_FROM_EMAIL || TO_EMAIL.length === 0) {
   console.error('Missing email settings');
   process.exit(1);
 }
@@ -442,16 +445,18 @@ async function sendEmail({ subject, html, attachments }) {
     log('debug', `Recipients: ${TO_EMAIL.join(', ')}`);
     
     const transporter = nodemailer.createTransport({
-      host: SMTP_SERVER,
-      port: SMTP_PORT,
-      secure: SMTP_PORT === 465,
-      auth: { user: SMTP_USERNAME, pass: SMTP_PASSWORD },
+      host: MAIL_SMTP_HOST,
+      port: MAIL_SMTP_PORT,
+      secure: MAIL_SMTP_USE_SSL,
+      auth: { user: MAIL_USERNAME, pass: MAIL_PASSWORD },
     });
 
     log('info', 'Sending email...');
     const info = await transporter.sendMail({
-      from: FROM_EMAIL,
+      from: MAIL_FROM_EMAIL,
       to: TO_EMAIL,
+      cc: CC_EMAIL.length > 0 ? CC_EMAIL : undefined,
+      bcc: BCC_EMAIL.length > 0 ? BCC_EMAIL : undefined,
       subject,
       html,
       attachments,

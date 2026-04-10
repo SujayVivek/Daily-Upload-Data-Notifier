@@ -24,11 +24,13 @@ const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 const AWS_ACCESS_KEY_ID = process.env.AWS_ACCESS_KEY_ID;
 const AWS_SECRET_ACCESS_KEY = process.env.AWS_SECRET_ACCESS_KEY;
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
-const FROM_EMAIL = process.env.FROM_EMAIL || process.env.SMTP_USERNAME;
-const SMTP_SERVER = process.env.SMTP_SERVER || 'smtp.gmail.com';
-const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
-const SMTP_USERNAME = process.env.SMTP_USERNAME;
-const SMTP_PASSWORD = process.env.SMTP_PASSWORD;
+const MAIL_ENABLED = process.env.MAIL_ENABLED === 'true';
+const MAIL_SMTP_HOST = process.env.MAIL_SMTP_HOST || 'smtp.zoho.com';
+const MAIL_SMTP_PORT = Number(process.env.MAIL_SMTP_PORT || 465);
+const MAIL_SMTP_USE_SSL = process.env.MAIL_SMTP_USE_SSL === 'true';
+const MAIL_FROM_EMAIL = process.env.MAIL_FROM_EMAIL;
+const MAIL_USERNAME = process.env.MAIL_USERNAME;
+const MAIL_PASSWORD = process.env.MAIL_PASSWORD;
 
 // Parse TO_EMAIL from environment
 function parseEnvEmails(raw) {
@@ -63,7 +65,9 @@ function parseEnvEmails(raw) {
     .filter(Boolean);
 }
 
-const TO_EMAIL = parseEnvEmails(process.env.TO_EMAIL || '');
+const TO_EMAIL = parseEnvEmails(process.env.MAIL_TO || process.env.TO_EMAIL || '');
+const CC_EMAIL = parseEnvEmails(process.env.MAIL_CC || '');
+const BCC_EMAIL = parseEnvEmails(process.env.MAIL_BCC || '');
 
 // Initialize clients
 const s3 = new S3Client({
@@ -78,7 +82,7 @@ const anthropic = new Anthropic({
   apiKey: CLAUDE_API_KEY,
 });
 
-const CLAUDE_MODEL = 'claude-3-5-sonnet-20240620';
+const CLAUDE_MODEL = 'claude-haiku-4-5-20251001';
 
 function log(level, msg) {
   const ts = DateTime.now().setZone('Asia/Kolkata').toFormat('HH:mm:ss');
@@ -182,45 +186,33 @@ async function generateSummaryWithClaude(fileName, directory, fileContent, retri
     try {
       const contentPreview = fileContent.slice(0, 10000);
       
-        const prompt = `You are a domain analyst summarizing one source document for downstream retrieval and decision support.
+      const prompt = `You are a domain analyst summarizing one source document for downstream retrieval and decision support.
 
 File: ${fileName}
-    Directory: ${directory}
+Directory: ${directory}
 
 Content:
 ${contentPreview}
 
 INSTRUCTIONS:
-  1. Read the provided text and summarize ONLY what is explicitly present.
-  2. Write EXACTLY 5 bullet lines, each starting with "- ".
-  3. Every bullet must contain at least one concrete anchor from the text, such as:
-       - a date, period, section/article/circular/notification number
-       - a named party/authority/court/body
-       - a numeric value, threshold, rate, penalty, amount, or count
-       - a specific action/outcome (approved/rejected/amended/exempted/liable/etc.)
-  4. Start each bullet directly with concrete content from the file. Do NOT start with generic framing like "This document", "The document", "It", or "This appears to be".
-    4. Capture these 5 angles in order:
-       - Main issue and scope of the document
-       - Key decision/change/finding
-       - Critical quantitative or legal details (rates, limits, dates, clauses)
-       - Applicability (who is affected, from when, conditions/exceptions)
-       - Practical impact or compliance consequence
-    5. If the text states that earlier circulars/notifications/orders are amended/superseded/withdrawn, mention the exact references and what changed.
-    6. If the document is not in English, understand it first and output in English.
-    7. If extraction is weak (e.g., scanned PDF), use only visible facts and state this clearly in one bullet with whatever concrete clues are present.
+1. Summarize ONLY the substantive document content explicitly present in the extracted text.
+2. Output EXACTLY ONE paragraph in English (4-7 sentences, no bullets, no numbering, no headings).
+3. Begin with the document title or subject line when available; if no clear title exists, begin with the most specific identifiable topic from the text.
+4. Include key facts from the body: main issue, decision/change/position, affected entities, effective dates/time periods, thresholds/amounts/rates, and compliance or practical impact.
+5. Mention references (notification/circular/order/section/case numbers) only when they support the substantive summary.
+6. If the text is partial or weakly extracted, still summarize visible substantive content and clearly state that details are limited.
 
-    STRICTLY FORBIDDEN:
-    - Generic openers like "This document appears to be" or "The document provides details".
-    - Any phrasing that hedges or guesses ("appears", "seems", "likely", "possibly").
-    - Vague statements without concrete facts.
-    - Invented facts or assumptions.
+STRICTLY FORBIDDEN:
+- Any mention of PDF/page/layout/metadata/font/encoding/object streams/compression/extraction mechanics.
+- Directory path analysis, file classification labels, or technical forensic commentary.
+- Generic filler, hedging, or speculation.
+- Invented facts.
 
-    OUTPUT FORMAT:
-    - Exactly 5 bullet points
-    - English only
-    - No heading, no preamble, no markdown except the bullet marker
-    - Keep each bullet to 1 sentence
-    `;
+OUTPUT FORMAT:
+- Single paragraph only.
+- Plain text only.
+- No markdown.
+`;
 
       const message = await anthropic.messages.create({
         model: CLAUDE_MODEL,
@@ -232,7 +224,14 @@ INSTRUCTIONS:
         }],
       });
 
-      const summary = message.content[0].text.trim();
+      const summaryRaw = message.content[0].text.trim();
+      const summary = summaryRaw
+        .split(/\r?\n/)
+        .map(line => line.replace(/^\s*[-*]\s+/, '').trim())
+        .filter(Boolean)
+        .join(' ')
+        .replace(/\s{2,}/g, ' ')
+        .trim();
       
       return summary;
     } catch (error) {
@@ -418,10 +417,10 @@ async function sendEmail(summaryFilePath, uploadReportPath) {
   
   try {
     const transporter = nodemailer.createTransport({
-      host: SMTP_SERVER,
-      port: SMTP_PORT,
-      secure: SMTP_PORT === 465,
-      auth: { user: SMTP_USERNAME, pass: SMTP_PASSWORD },
+      host: MAIL_SMTP_HOST,
+      port: MAIL_SMTP_PORT,
+      secure: MAIL_SMTP_USE_SSL,
+      auth: { user: MAIL_USERNAME, pass: MAIL_PASSWORD },
     });
 
     // Extract date from filename for subject
@@ -468,8 +467,10 @@ Sent automatically by NeurasixAI Batch Processing System
 </table>`;
 
     const info = await transporter.sendMail({
-      from: FROM_EMAIL,
+      from: MAIL_FROM_EMAIL,
       to: TO_EMAIL,
+      cc: CC_EMAIL.length > 0 ? CC_EMAIL : undefined,
+      bcc: BCC_EMAIL.length > 0 ? BCC_EMAIL : undefined,
       subject,
       html,
       attachments: [
